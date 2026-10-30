@@ -1,5 +1,7 @@
 """OTT v2 bot: iterative-deepening alpha-beta with pondering. Standard library only.
 
+Rules handled: 25 moves per side (50 plies); after ply 50 the side with more pieces wins.
+
 * Position is kept in mutable arrays with make/unmake and a Zobrist hash.
 * Search: negamax + PVS, transposition table, history ordering, and a
   quiescence search over captures / goal moves / forced goal defence.
@@ -39,6 +41,8 @@ _rng = random.Random(0x0771)
 ZP = [[_rng.getrandbits(62) for _ in range(81)] for _ in range(7)]
 ZB = [_rng.getrandbits(62) for _ in range(81)]
 ZT = _rng.getrandbits(62)
+ZN = [_rng.getrandbits(62) for _ in range(64)]
+MAX_PLIES = 50
 
 # ---- mutable position -------------------------------------------------------
 BOARD = [0] * 81
@@ -58,6 +62,9 @@ NODES = 0
 BESTMV = -1
 CPU_END = WALL_END = 0.0
 PONDER = False
+P0 = 0
+MY_MOVES = 0
+FIRST = None
 Q = queue.Queue()
 
 
@@ -150,7 +157,7 @@ def restore(snap):
 
 
 # ---- moves ------------------------------------------------------------------
-def make(s, st, en, h):
+def make(s, st, en, h, n):
     p = BOARD[st]
     t = BOARD[en]
     bomb = BOMB[en]
@@ -177,6 +184,9 @@ def make(s, st, en, h):
         h ^= ZP[p][en]
         if en == GOAL[s] or (t and CNT[t] == 0):
             out = 1
+    if not out and n >= MAX_PLIES:
+        diff = len(PCS[s]) - len(PCS[1 - s])
+        out = 1 if diff > 0 else (-1 if diff < 0 else 2)
     return h, p, t, bomb, out
 
 
@@ -238,7 +248,7 @@ def can_win_now(o):
     return False
 
 
-def evaluate(s):
+def evaluate(s, n):
     score = 0
     for side in (0, 1):
         b = side * 3
@@ -252,7 +262,10 @@ def evaluate(s):
             total += d
             if d < best:
                 best = d
-        v += ADV[best if best < 12 else 12] - total * AVG_W // len(pieces)
+        left = (MAX_PLIES - n + (1 if side == s else 0)) // 2
+        if best <= left:
+            v += ADV[best if best < 12 else 12]
+        v -= total * AVG_W * (left if left < 12 else 12) // (12 * len(pieces))
         score += v if side == s else -v
     return score
 
@@ -272,16 +285,17 @@ def qsearch(alpha, beta, ply, s, h, qd):
     if not NODES & 127:
         check_time()
     o = 1 - s
+    n = P0 + ply
     threat = can_win_now(o)
     if threat:
         if qd < -3:
-            return evaluate(s)
+            return evaluate(s, n)
         best = -INF
         moves = gen(s, -1, False)
         if not moves:
             return -WIN + ply
     else:
-        best = evaluate(s)
+        best = evaluate(s, n)
         if best >= beta:
             return best
         if best > alpha:
@@ -290,9 +304,9 @@ def qsearch(alpha, beta, ply, s, h, qd):
             return best
         moves = gen(s, -1, True)
     for _, st, en in moves:
-        nh, p, t, bomb, out = make(s, st, en, h)
+        nh, p, t, bomb, out = make(s, st, en, h, n + 1)
         if out:
-            score = (WIN - ply - 1) * out
+            score = 0 if out == 2 else (WIN - ply - 1) * out
         else:
             score = -qsearch(-beta, -alpha, ply + 1, o, nh, qd - 1)
         unmake(s, st, en, p, t, bomb)
@@ -314,7 +328,9 @@ def negamax(depth, alpha, beta, ply, s, h):
         check_time()
     alpha0 = alpha
     ttmv = -1
-    e = TT.get(h)
+    n = P0 + ply
+    key = h ^ ZN[n]
+    e = TT.get(key)
     if e is not None:
         ttmv = e & 8191
         e >>= 13
@@ -342,9 +358,9 @@ def negamax(depth, alpha, beta, ply, s, h):
     bestmv = -1
     first = True
     for _, st, en in moves:
-        nh, p, t, bomb, out = make(s, st, en, h)
+        nh, p, t, bomb, out = make(s, st, en, h, n + 1)
         if out:
-            score = (WIN - ply - 1) * out
+            score = 0 if out == 2 else (WIN - ply - 1) * out
         else:
             seen = SEEN.get(nh, 0)
             if seen >= 2:
@@ -375,13 +391,13 @@ def negamax(depth, alpha, beta, ply, s, h):
     if not ply:
         BESTMV = bestmv
     flag = 0 if alpha0 < best < beta else (1 if best >= beta else 2)
-    if len(TT) < TT_CAP or h in TT:
+    if len(TT) < TT_CAP or key in TT:
         sc = best
         if sc > WIN - 1000:
             sc += ply
         elif sc < -WIN + 1000:
             sc -= ply
-        TT[h] = ((((sc + OFF) << 2 | flag) << 6 | depth) << 13) | (bestmv if bestmv >= 0 else 8191)
+        TT[key] = ((((sc + OFF) << 2 | flag) << 6 | depth) << 13) | (bestmv if bestmv >= 0 else 8191)
     return best
 
 
@@ -392,7 +408,7 @@ def iterate(s, h, max_depth, soft=None, started=0.0):
     SEEN = dict(GAME_SEEN)
     result = (-1, 0, 0)
     try:
-        for depth in range(1, max_depth + 1):
+        for depth in range(1, min(max_depth, MAX_PLIES - P0) + 1):
             BESTMV = -1
             score = negamax(depth, -INF, INF, 0, s, h)
             if BESTMV >= 0:
@@ -415,23 +431,31 @@ def fallback_move(s):
 
 
 def decide(state):
-    global PONDER, CPU_END, WALL_END
+    global PONDER, CPU_END, WALL_END, P0, MY_MOVES, FIRST
     s, h = load_position(state)
     GAME_SEEN[h] = GAME_SEEN.get(h, 0) + 1
     info = state.get("time") or {}
-    cpu_left = info.get("cpu_remaining_seconds", {}).get("AB"[s], 5.0)
-    wall_left = info.get("response_remaining_seconds", 1.0)
-    cpu_slice = min(0.25, 0.05 * cpu_left) if cpu_left > 0.15 else 0.0
-    wall_slice = max(0.05, min(0.55, wall_left - 0.3))
+    budget = info.get("cpu_budget_seconds", 7.0)
+    cpu_left = info.get("cpu_remaining_seconds", {}).get("AB"[s], budget)
+    wall_left = info.get("response_remaining_seconds", 2.5)
+    if FIRST is None:
+        # The opponent has already spent CPU only if it moved before our first turn.
+        opp_left = info.get("cpu_remaining_seconds", {}).get("BA"[s], budget)
+        FIRST = budget - opp_left < 1e-6
+    P0 = 2 * MY_MOVES + (0 if FIRST else 1)
+    my_left = max(1, MAX_PLIES // 2 - MY_MOVES)
+    MY_MOVES += 1
+    cpu_slice = min(0.6, 0.7 * cpu_left / my_left) if cpu_left > 0.12 else 0.0
+    wall_slice = max(0.05, min(1.6, wall_left - 0.5))
     code = -1
     if cpu_slice > 0:
         PONDER = False
         now = monotonic()
         CPU_END = process_time() + cpu_slice
-        WALL_END = now + min(wall_slice, cpu_slice * 3 + 0.05)
-        code, _, _ = iterate(s, h, MAX_DEPTH, soft=0.3 * min(cpu_slice * 1.5, wall_slice), started=now)
+        WALL_END = now + min(wall_slice, cpu_slice * 3 + 0.1)
+        code, _, _ = iterate(s, h, MAX_DEPTH, soft=0.35 * cpu_slice, started=now)
     if code < 0:
-        e = TT.get(h)
+        e = TT.get(h ^ ZN[P0])
         code = (e & 8191) if e is not None and (e & 8191) != 8191 else -1
         if code >= 0 and (BOARD[code // 81] == 0 or SIDE_OF[BOARD[code // 81]] != s):
             code = -1
@@ -441,9 +465,10 @@ def decide(state):
 
 
 def ponder(s, h, code):
-    global PONDER
+    global PONDER, P0
     st, en = divmod(code, 81)
-    nh, p, t, bomb, out = make(s, st, en, h)
+    nh, p, t, bomb, out = make(s, st, en, h, P0 + 1)
+    P0 += 1
     GAME_SEEN[nh] = GAME_SEEN.get(nh, 0) + 1
     if out:
         return
